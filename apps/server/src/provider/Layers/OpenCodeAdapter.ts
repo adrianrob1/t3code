@@ -8,6 +8,7 @@ import {
   type ProviderSession,
   RuntimeItemId,
   RuntimeRequestId,
+  RuntimeTaskId,
   ThreadId,
   type ToolLifecycleItemType,
   type TurnTokenUsage,
@@ -173,6 +174,51 @@ export function isSameOpenCodeDirectory(
 interface OpenCodeTurnSnapshot {
   readonly id: TurnId;
   readonly items: Array<unknown>;
+}
+
+type OpenCodeToolPart = Extract<Part, { type: "tool" }>;
+
+/**
+ * One native Task call as the Agents panel sees it. Identity is the child
+ * session id (OpenCode's `task_id`), so a resumed Task reactivates the same
+ * agent row instead of adding one per tool call.
+ */
+interface OpenCodeTaskLifecycle {
+  readonly taskId: RuntimeTaskId;
+  readonly toolUseId: string | undefined;
+  readonly description: string | undefined;
+  readonly title: string | undefined;
+  readonly role: string | undefined;
+  readonly model: string | undefined;
+  status: "running" | "completed" | "failed" | "stopped" | undefined;
+}
+
+interface OpenCodeTaskNotification {
+  readonly taskId: RuntimeTaskId;
+  readonly status: "completed" | "failed";
+  readonly summary: string | undefined;
+}
+
+interface OpenCodeStoredTaskTerminal {
+  readonly notification: OpenCodeTaskNotification;
+  readonly raw: Part;
+  readonly eventId: EventId;
+}
+
+interface OpenCodeStoredTaskHistory {
+  readonly tasks: ReadonlyArray<OpenCodeTaskLifecycle>;
+  readonly terminals: ReadonlyArray<OpenCodeStoredTaskTerminal>;
+}
+
+const emptyOpenCodeTaskHistory: OpenCodeStoredTaskHistory = { tasks: [], terminals: [] };
+
+/**
+ * Last observed state of a Task tool part. Tool parts are deliberately not
+ * cached with text parts, so this is the only memory of the previous status.
+ */
+interface OpenCodeTaskPartSnapshot {
+  readonly status: OpenCodeToolPart["state"]["status"];
+  readonly taskId: RuntimeTaskId | undefined;
 }
 
 type OpenCodeSubscribedEvent =
@@ -347,6 +393,8 @@ interface OpenCodeSessionContext {
   readonly pendingPermissions: Map<string, PermissionRequest>;
   readonly pendingQuestions: Map<string, QuestionRequest>;
   readonly messageRoleById: Map<string, "user" | "assistant">;
+  readonly taskLifecycleByTaskId: Map<RuntimeTaskId, OpenCodeTaskLifecycle>;
+  readonly taskPartSnapshotById: Map<string, OpenCodeTaskPartSnapshot>;
   // OpenCode permits edits to completed parts. Keep text for snapshot comparison
   // until native removal or session teardown, but do not retain other part payloads.
   readonly textPartsByMessageId: Map<string, Map<string, OpenCodeTextPartState>>;
@@ -491,6 +539,7 @@ const toProcessError = (threadId: ThreadId, cause: unknown): ProviderAdapterProc
   });
 
 type EventBaseInput = {
+  readonly eventId?: EventId | undefined;
   readonly threadId: ThreadId;
   readonly turnId?: TurnId | undefined;
   readonly itemId?: string | undefined;
@@ -706,6 +755,159 @@ function toolStateCreatedAt(part: Extract<Part, { type: "tool" }>): string | und
     default:
       return undefined;
   }
+}
+
+function isTerminalOpenCodeTaskStatus(
+  status: OpenCodeTaskLifecycle["status"],
+): status is "completed" | "failed" | "stopped" {
+  return status === "completed" || status === "failed" || status === "stopped";
+}
+
+/**
+ * Child session id of a native Task call. OpenCode stamps it on the part's
+ * metadata once the child session exists; a resumed Task also names it in
+ * the input as `task_id`.
+ */
+function taskIdFromPart(part: OpenCodeToolPart): RuntimeTaskId | undefined {
+  if (part.tool.toLowerCase() !== "task" || part.state.status === "pending") {
+    return undefined;
+  }
+
+  const metadata = part.state.metadata;
+  const taskId = trimText(
+    typeof metadata?.["sessionId"] === "string"
+      ? metadata["sessionId"]
+      : typeof part.state.input["task_id"] === "string"
+        ? part.state.input["task_id"]
+        : undefined,
+  );
+  return taskId ? RuntimeTaskId.make(taskId) : undefined;
+}
+
+function taskLifecycleFromPart(
+  part: OpenCodeToolPart,
+  previous: OpenCodeTaskLifecycle | undefined,
+): OpenCodeTaskLifecycle | undefined {
+  if (part.tool.toLowerCase() !== "task" || part.state.status === "pending") {
+    return undefined;
+  }
+
+  const taskId = taskIdFromPart(part) ?? previous?.taskId;
+  if (!taskId) {
+    return previous;
+  }
+
+  const metadata = part.state.metadata;
+  const input = part.state.input;
+  const modelMetadata = metadata?.["model"];
+  const modelRecord =
+    typeof modelMetadata === "object" && modelMetadata !== null
+      ? (modelMetadata as Record<string, unknown>)
+      : undefined;
+  const providerId = trimText(
+    typeof modelRecord?.["providerID"] === "string" ? modelRecord["providerID"] : undefined,
+  );
+  const modelId = trimText(
+    typeof modelRecord?.["modelID"] === "string" ? modelRecord["modelID"] : undefined,
+  );
+  const description = trimText(
+    typeof input["description"] === "string" ? input["description"] : undefined,
+  );
+
+  return {
+    taskId,
+    toolUseId: part.callID,
+    description: description ?? previous?.description,
+    title:
+      (part.state.status !== "error" ? trimText(part.state.title) : undefined) ??
+      description ??
+      previous?.title,
+    role:
+      trimText(typeof input["subagent_type"] === "string" ? input["subagent_type"] : undefined) ??
+      previous?.role,
+    model: providerId && modelId ? `${providerId}/${modelId}` : previous?.model,
+    status: previous?.status ?? "running",
+  };
+}
+
+function openCodeTaskResult(output: string): string | undefined {
+  if (!output.trim()) {
+    return undefined;
+  }
+
+  // Private OpenCode CLI helper; the SDK does not export it. Source:
+  // https://github.com/anomalyco/opencode/blob/14b37df39168eaf6a6faf862ec4a7bbe9c825bbd/packages/opencode/src/cli/cmd/run/tool.ts
+  const resultStart = output.indexOf("<task_result>");
+  const resultEnd = output.lastIndexOf("</task_result>");
+  if (resultStart >= 0 && resultEnd > resultStart) {
+    return trimText(output.slice(resultStart + "<task_result>".length, resultEnd));
+  }
+
+  return trimText(
+    output
+      .split("\n")
+      .filter((line) => !line.startsWith("task_id:"))
+      .join("\n"),
+  );
+}
+
+/** Background Task completions arrive as a synthetic text part in the parent transcript. */
+function taskNotificationFromPart(part: Part): OpenCodeTaskNotification | undefined {
+  if (part.type !== "text" || part.synthetic !== true) {
+    return undefined;
+  }
+
+  // Private OpenCode Task envelope source:
+  // https://github.com/anomalyco/opencode/blob/14b37df39168eaf6a6faf862ec4a7bbe9c825bbd/packages/opencode/src/tool/task.ts
+  const envelope = part.text.match(/<task id="([^"]+)" state="(completed|error)">/);
+  const taskId = trimText(envelope?.[1]);
+  if (!taskId) {
+    return undefined;
+  }
+  const failed = envelope?.[2] === "error";
+  const error = failed
+    ? trimText(part.text.match(/<task_error>\s*([\s\S]*?)\s*<\/task_error>/)?.[1])
+    : undefined;
+  return {
+    taskId: RuntimeTaskId.make(taskId),
+    status: failed ? "failed" : "completed",
+    summary: failed ? error : openCodeTaskResult(part.text),
+  };
+}
+
+/** Foreground Task terminals live on the tool part itself; background ones only signal launch. */
+function taskNotificationFromToolPart(part: Part): OpenCodeTaskNotification | undefined {
+  if (
+    part.type !== "tool" ||
+    (part.state.status !== "completed" && part.state.status !== "error")
+  ) {
+    return undefined;
+  }
+  const taskId = taskIdFromPart(part);
+  if (
+    !taskId ||
+    (part.state.status === "completed" && part.state.metadata["background"] === true)
+  ) {
+    return undefined;
+  }
+  const summary = trimText(
+    part.state.status === "error" ? part.state.error : openCodeTaskResult(part.state.output),
+  );
+  return {
+    taskId,
+    status: part.state.status === "error" ? "failed" : "completed",
+    summary,
+  };
+}
+
+function taskLinkage(task: OpenCodeTaskLifecycle) {
+  return {
+    taskType: "subagent",
+    ...(task.title ? { title: task.title } : {}),
+    ...(task.role ? { role: task.role } : {}),
+    ...(task.model ? { model: task.model } : {}),
+    ...(task.toolUseId ? { toolUseId: task.toolUseId } : {}),
+  };
 }
 
 function sessionErrorMessage(error: unknown): string {
@@ -1022,7 +1224,10 @@ export function makeOpenCodeAdapter(
     });
     const buildEventBase = (input: EventBaseInput) =>
       Effect.all({
-        eventId: randomUUIDv4.pipe(Effect.map(EventId.make)),
+        eventId:
+          input.eventId === undefined
+            ? randomUUIDv4.pipe(Effect.map(EventId.make))
+            : Effect.succeed(input.eventId),
         createdAt: input.createdAt === undefined ? nowIso : Effect.succeed(input.createdAt),
       }).pipe(
         Effect.map(({ eventId, createdAt }) => ({
@@ -1513,6 +1718,7 @@ export function makeOpenCodeAdapter(
           { clearActiveTurnId: true, clearLastError: true },
         );
       }
+      yield* settleRunningOpenCodeTasks(context, turnId, raw);
       yield* clearPendingOpenCodeRequests(context, { type: "session.abort" });
       yield* emit({
         ...(yield* buildEventBase({
@@ -1640,6 +1846,310 @@ export function makeOpenCodeAdapter(
           },
         });
       }
+    });
+
+    /**
+     * Marks a Task terminal in adapter state, or returns undefined when it
+     * already settled. State moves before any emit so a live replay of the
+     * same terminal, interleaved at an emit yield point, sees it settled.
+     */
+    const settleOpenCodeTask = (
+      context: OpenCodeSessionContext,
+      taskId: RuntimeTaskId,
+      status: "completed" | "failed",
+    ): OpenCodeTaskLifecycle | undefined => {
+      const existing = context.taskLifecycleByTaskId.get(taskId);
+      if (existing && isTerminalOpenCodeTaskStatus(existing.status)) {
+        return undefined;
+      }
+      const task: OpenCodeTaskLifecycle = existing ?? {
+        taskId,
+        toolUseId: undefined,
+        description: undefined,
+        title: undefined,
+        role: undefined,
+        model: undefined,
+        status: undefined,
+      };
+      task.status = status;
+      context.taskLifecycleByTaskId.set(taskId, task);
+      return task;
+    };
+
+    const emitTaskTerminal = Effect.fn("emitTaskTerminal")(function* (
+      context: OpenCodeSessionContext,
+      task: OpenCodeTaskLifecycle,
+      notification: OpenCodeTaskNotification,
+      turnId: TurnId | undefined,
+      raw: unknown,
+      eventId?: EventId,
+    ) {
+      yield* emit({
+        ...(yield* buildEventBase({
+          eventId,
+          threadId: context.session.threadId,
+          turnId,
+          itemId: task.toolUseId,
+          raw,
+        })),
+        type: "task.completed",
+        payload: {
+          taskId: task.taskId,
+          status: notification.status,
+          ...(notification.summary ? { summary: notification.summary } : {}),
+          ...taskLinkage(task),
+        },
+      });
+    });
+
+    const emitTaskNotification = Effect.fn("emitTaskNotification")(function* (
+      context: OpenCodeSessionContext,
+      notification: OpenCodeTaskNotification,
+      turnId: TurnId | undefined,
+      raw: unknown,
+    ) {
+      const task = settleOpenCodeTask(context, notification.taskId, notification.status);
+      if (task) {
+        yield* emitTaskTerminal(context, task, notification, turnId, raw);
+      }
+    });
+
+    /**
+     * Stop aborts every child session, so each Task still running settles
+     * as stopped. A late part for that same tool call is then a replay and
+     * cannot reopen the row.
+     */
+    const settleRunningOpenCodeTasks = Effect.fn("settleRunningOpenCodeTasks")(function* (
+      context: OpenCodeSessionContext,
+      turnId: TurnId,
+      raw: unknown,
+    ) {
+      for (const task of context.taskLifecycleByTaskId.values()) {
+        if (task.status !== "running") {
+          continue;
+        }
+        task.status = "stopped";
+        yield* emit({
+          ...(yield* buildEventBase({
+            threadId: context.session.threadId,
+            turnId,
+            itemId: task.toolUseId,
+            raw,
+          })),
+          type: "task.completed",
+          payload: {
+            taskId: task.taskId,
+            status: "stopped",
+            ...taskLinkage(task),
+          },
+        });
+      }
+    });
+
+    /**
+     * Mirrors a native Task tool part onto the task.* lifecycle. A Task that
+     * resumes a known child (new tool call, same task id) reactivates the
+     * existing agent; a background Task stays running until its notification
+     * lands in the parent transcript.
+     */
+    const projectOpenCodeTaskPart = Effect.fn("projectOpenCodeTaskPart")(function* (
+      context: OpenCodeSessionContext,
+      part: OpenCodeToolPart,
+      turnId: TurnId | undefined,
+      raw: unknown,
+    ) {
+      if (part.tool.toLowerCase() !== "task") {
+        return;
+      }
+      const previousSnapshot = context.taskPartSnapshotById.get(part.id);
+      const knownTaskId = taskIdFromPart(part) ?? previousSnapshot?.taskId;
+      context.taskPartSnapshotById.set(part.id, { status: part.state.status, taskId: knownTaskId });
+      if (part.state.status === "pending") {
+        return;
+      }
+      const previousTaskPart =
+        previousSnapshot?.taskId && previousSnapshot.status !== "pending"
+          ? previousSnapshot
+          : undefined;
+      const previousTask = knownTaskId ? context.taskLifecycleByTaskId.get(knownTaskId) : undefined;
+      const task = taskLifecycleFromPart(part, previousTask);
+      if (!task) {
+        return;
+      }
+      // Once a tool call settled its child, every later part for that same
+      // call is a replay (or a late duplicate) and must not reopen the row.
+      const settledSameCall =
+        previousTask?.toolUseId === part.callID &&
+        isTerminalOpenCodeTaskStatus(previousTask.status);
+      if (settledSameCall || previousTaskPart?.status === part.state.status) {
+        context.taskLifecycleByTaskId.set(task.taskId, task);
+        return;
+      }
+
+      const linkage = taskLinkage(task);
+      if (!previousTaskPart) {
+        // The child reported its terminal before this session saw the
+        // launching tool call; start the row without reopening it.
+        const completedBeforeStart =
+          previousTask !== undefined &&
+          previousTask.toolUseId === undefined &&
+          isTerminalOpenCodeTaskStatus(previousTask.status);
+        // Stored history establishes status for Stop, but its running tasks
+        // have not yet been announced by this connection's live stream.
+        const taskEventBaseInput = {
+          threadId: context.session.threadId,
+          turnId,
+          itemId: part.callID,
+          createdAt: isoFromEpochMs(part.state.time.start),
+          raw,
+        };
+        const startedBase = yield* buildEventBase(taskEventBaseInput);
+        yield* emit(
+          previousTask && !completedBeforeStart
+            ? {
+                ...startedBase,
+                type: "task.updated",
+                payload: {
+                  taskId: task.taskId,
+                  status: "running",
+                  ...(task.description ? { description: task.description } : {}),
+                  ...linkage,
+                },
+              }
+            : {
+                ...startedBase,
+                type: "task.started",
+                payload: {
+                  taskId: task.taskId,
+                  ...(task.description ? { description: task.description } : {}),
+                  ...linkage,
+                },
+              },
+        );
+        if (!previousTask && typeof part.state.input["task_id"] === "string") {
+          // Resuming a child this session never saw: the row starts, then
+          // reads as a continuation rather than a first run.
+          yield* emit({
+            ...(yield* buildEventBase(taskEventBaseInput)),
+            type: "task.updated",
+            payload: {
+              taskId: task.taskId,
+              status: "running",
+              ...(task.description ? { description: task.description } : {}),
+              ...linkage,
+            },
+          });
+        }
+        if (!completedBeforeStart) {
+          task.status = "running";
+        }
+      }
+      context.taskLifecycleByTaskId.set(task.taskId, task);
+
+      const remainsRunning =
+        part.state.status === "completed" && part.state.metadata["background"] === true;
+      if (remainsRunning || (part.state.status !== "completed" && part.state.status !== "error")) {
+        return;
+      }
+      const failed = part.state.status === "error";
+      const summary = trimText(
+        part.state.status === "error" ? part.state.error : openCodeTaskResult(part.state.output),
+      );
+      task.status = failed ? "failed" : "completed";
+      yield* emit({
+        ...(yield* buildEventBase({
+          threadId: context.session.threadId,
+          turnId,
+          itemId: part.callID,
+          createdAt: isoFromEpochMs(part.state.time.end),
+          raw,
+        })),
+        type: "task.completed",
+        payload: {
+          taskId: task.taskId,
+          status: failed ? "failed" : "completed",
+          ...(summary ? { summary } : {}),
+          ...linkage,
+        },
+      });
+    });
+
+    /**
+     * Rebuilds Task identity and the latest terminal per child from the
+     * stored transcript, so a resumed thread shows its settled agents and
+     * does not re-announce them when the live stream replays their parts.
+     */
+    const loadStoredTaskHistory = Effect.fn("loadStoredTaskHistory")(function* (
+      context: OpenCodeSessionContext,
+    ) {
+      const messages = yield* runOpenCodeSdk("session.messages", () =>
+        context.client.session.messages({ sessionID: context.openCodeSessionId }),
+      );
+      const latestByTaskId = new Map<
+        RuntimeTaskId,
+        {
+          callId: string | undefined;
+          task: OpenCodeTaskLifecycle | undefined;
+          terminal: { notification: OpenCodeTaskNotification; raw: Part } | undefined;
+        }
+      >();
+
+      for (const entry of messages.data ?? []) {
+        for (const part of entry.parts) {
+          if (entry.info.role === "assistant" && part.type === "tool") {
+            const taskId = taskIdFromPart(part);
+            if (taskId) {
+              const current = latestByTaskId.get(taskId);
+              if (current?.callId !== part.callID) {
+                latestByTaskId.set(taskId, {
+                  callId: part.callID,
+                  task: taskLifecycleFromPart(part, undefined),
+                  terminal: undefined,
+                });
+              } else {
+                current.task = taskLifecycleFromPart(part, current.task);
+              }
+            }
+          }
+
+          const terminal =
+            taskNotificationFromPart(part) ??
+            (entry.info.role === "assistant" ? taskNotificationFromToolPart(part) : undefined);
+          if (!terminal) {
+            continue;
+          }
+          const current = latestByTaskId.get(terminal.taskId);
+          if (current) {
+            current.terminal = { notification: terminal, raw: part };
+          } else {
+            latestByTaskId.set(terminal.taskId, {
+              callId: undefined,
+              task: undefined,
+              terminal: { notification: terminal, raw: part },
+            });
+          }
+        }
+      }
+
+      const tasks: Array<OpenCodeTaskLifecycle> = [];
+      const terminals: Array<OpenCodeStoredTaskTerminal> = [];
+      for (const state of latestByTaskId.values()) {
+        if (state.task) {
+          tasks.push(state.task);
+        }
+        if (state.terminal) {
+          terminals.push({
+            notification: state.terminal.notification,
+            raw: state.terminal.raw,
+            // Stable across reconnects so replaying history never duplicates
+            // a settled agent in the projection.
+            eventId: EventId.make(
+              `opencode-task-history:${context.session.threadId}:${context.openCodeSessionId}:${state.terminal.raw.id}`,
+            ),
+          });
+        }
+      }
+      return { tasks, terminals };
     });
 
     // Records a child session of this thread. A child seen during a live turn
@@ -2427,6 +2937,11 @@ export function makeOpenCodeAdapter(
           const part = event.properties.part;
           const messageRole = messageRoleForPart(context, part);
 
+          const notification = taskNotificationFromPart(part);
+          if (notification) {
+            yield* emitTaskNotification(context, notification, turnId, event);
+          }
+
           if (turnId && part.type === "step-finish" && context.turnTokenUsage) {
             const usage = context.turnTokenUsage;
             const ownership = usage.assistantOwnershipByMessageId.get(part.messageID);
@@ -2505,6 +3020,7 @@ export function makeOpenCodeAdapter(
               payload,
             };
             yield* emit(runtimeEvent);
+            yield* projectOpenCodeTaskPart(context, part, turnId, event);
           }
           break;
         }
@@ -2890,7 +3406,7 @@ export function makeOpenCodeAdapter(
                       permission: buildOpenCodePermissionRules(input.runtimeMode),
                     }),
                   );
-                  return { openCodeSession: reusable, created: false };
+                  return { openCodeSession: reusable, created: false, resumed: true };
                 }
 
                 // The session lives under a different cwd (e.g. the thread
@@ -2917,7 +3433,7 @@ export function makeOpenCodeAdapter(
                       permission: buildOpenCodePermissionRules(input.runtimeMode),
                     }),
                   );
-                  return { openCodeSession: forked, created: true };
+                  return { openCodeSession: forked, created: true, resumed: true };
                 }
 
                 if (resumeSessionId) {
@@ -2937,7 +3453,7 @@ export function makeOpenCodeAdapter(
                     detail: "OpenCode session.create returned no session payload.",
                   });
                 }
-                return { openCodeSession: createdSession.data, created: true };
+                return { openCodeSession: createdSession.data, created: true, resumed: false };
               });
 
               return {
@@ -2946,6 +3462,7 @@ export function makeOpenCodeAdapter(
                 client,
                 openCodeSession: resolved.openCodeSession,
                 created: resolved.created,
+                resumed: resolved.resumed,
               };
             }).pipe(Effect.provideService(Scope.Scope, sessionScope)),
           );
@@ -2989,6 +3506,8 @@ export function makeOpenCodeAdapter(
           requestRelationRetries: new Map(),
           pendingPermissions: new Map(),
           pendingQuestions: new Map(),
+          taskLifecycleByTaskId: new Map(),
+          taskPartSnapshotById: new Map(),
           textPartsByMessageId: new Map(),
           messageRoleById: new Map(),
           turnTokenUsage: undefined,
@@ -3019,7 +3538,30 @@ export function makeOpenCodeAdapter(
         const cleanupStartingContext = closeStartingOpenCodeContext(context, started.created).pipe(
           Effect.ensuring(Effect.sync(() => deleteContextIfCurrent(context))),
         );
+        let storedTaskHistory = emptyOpenCodeTaskHistory;
         const connectionExit = yield* Effect.gen(function* () {
+          if (started.resumed) {
+            // Settle stored Task state before the pump runs so live replays
+            // of history parts compare against a settled record.
+            storedTaskHistory = yield* loadStoredTaskHistory(context).pipe(
+              Effect.timeout("10 seconds"),
+              Effect.catch((cause) =>
+                Effect.logWarning(
+                  `OpenCode Task history reconciliation failed: ${openCodeRuntimeErrorDetail(cause)}`,
+                ).pipe(Effect.as(emptyOpenCodeTaskHistory)),
+              ),
+            );
+            for (const task of storedTaskHistory.tasks) {
+              context.taskLifecycleByTaskId.set(task.taskId, task);
+            }
+            for (const terminal of storedTaskHistory.terminals) {
+              settleOpenCodeTask(
+                context,
+                terminal.notification.taskId,
+                terminal.notification.status,
+              );
+            }
+          }
           yield* startEventPump(context);
           yield* Deferred.await(context.firstConnection).pipe(
             Effect.timeout("10 seconds"),
@@ -3060,6 +3602,19 @@ export function makeOpenCodeAdapter(
             providerThreadId: started.openCodeSession.id,
           },
         });
+        for (const terminal of storedTaskHistory.terminals) {
+          const task = context.taskLifecycleByTaskId.get(terminal.notification.taskId);
+          if (task) {
+            yield* emitTaskTerminal(
+              context,
+              task,
+              terminal.notification,
+              undefined,
+              terminal.raw,
+              terminal.eventId,
+            );
+          }
+        }
 
         return context.session;
       },
